@@ -28,3 +28,11 @@ export async function getInstallationToken(installationId: number) {
   const auth = await octokit.auth({ type: "installation" }) as any;
   return { token: auth.token as string, expiresAt: new Date(auth.expiresAt) };
 }
+
+// Returns an @octokit/rest Octokit authenticated as the installation.
+// githubApp.getInstallationOctokit() returns an internal Octokit type that
+// doesn't expose .rest — this helper gives a standard Octokit that does.
+export async function getInstallationRestClient(installationId: number): Promise<InstanceType<typeof Octokit>> {
+  const { token } = await getInstallationToken(installationId);
+  return new Octokit({ auth: token });
+}
