@@ -60,11 +60,13 @@ router.get("/github/callback", async (req, res) => {
   });
 
   const token = signToken({ userId: ghUser.node_id, login: ghUser.login });
-  const isProd = process.env.NODE_ENV === "production";
+  // Use secure cross-site cookies whenever the frontend is served over HTTPS
+  // (covers both production and local-to-tunnel dev scenarios)
+  const crossOrigin = (process.env.FRONTEND_URL || "").startsWith("https://");
   res.cookie("token", token, {
     httpOnly: true,
-    secure: isProd,
-    sameSite: isProd ? "none" : "lax",
+    secure: crossOrigin,
+    sameSite: crossOrigin ? "none" : "lax",
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 

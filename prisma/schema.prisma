@@ -9,8 +9,11 @@ datasource db {
 
 enum PlanTier {
   free
-  pro
-  team
+  founding_solo
+  solo
+  duo
+  small_team
+  studio
 }
 
 model User {
@@ -23,6 +26,13 @@ model User {
   planTier    PlanTier @default(free) @map("plan_tier")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
+
+  paddleCustomerId     String?   @map("paddle_customer_id")
+  paddleSubscriptionId String?   @map("paddle_subscription_id")
+  subscriptionStatus   String?   @map("subscription_status")
+  subscriptionEndsAt   DateTime? @map("subscription_ends_at")
+  billingPeriod        String?   @map("billing_period")
+  prUsedThisMonth      Int       @default(0) @map("pr_used_this_month")
 
   installations Installation[]
 
