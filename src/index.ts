@@ -3,12 +3,15 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import cookieParser from "cookie-parser";
+import cron from "node-cron";
 
 import authRouter from "./routes/auth.js";
 import installRouter from "./routes/app-install.js";
 import webhookRouter from "./routes/webhook.js";
 import billingRouter from "./routes/billing.js";
 import paddleWebhookRouter from "./routes/paddle-webhook.js";
+import reviewsRouter from "./routes/reviews.js";
+import { db } from "./db/client.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -45,10 +48,18 @@ app.use((req, _res, next) => {
 app.use("/auth", authRouter);
 app.use("/app", installRouter);
 app.use("/billing", billingRouter);
+app.use("/reviews", reviewsRouter);
 app.use("/webhooks/github", webhookRouter);
 app.use("/webhooks/paddle", paddleWebhookRouter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Reset prUsedThisMonth for all users at midnight on the 1st of every month
+cron.schedule("0 0 1 * *", async () => {
+  console.log("[cron] Resetting monthly PR counters");
+  await db.user.updateMany({ data: { prUsedThisMonth: 0 } });
+  console.log("[cron] Monthly PR counters reset");
+});
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
