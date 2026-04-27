@@ -3,7 +3,8 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { db } from "../db/client.js";
 import { fetchPRDiff } from "../lib/pr-fetcher.js";
 import { reviewPRFiles } from "../lib/ai-reviewer.js";
-import { postPRReview } from "../lib/review-poster.js";
+import { postPRReview, postProcessingComment, deleteProcessingComment } from "../lib/review-poster.js";
+import { getInstallationRestClient } from "../lib/github-app.js";
 
 const router = Router();
 
@@ -122,6 +123,17 @@ async function handlePullRequest(payload: any) {
   const limit = PR_LIMITS[user.planTier] ?? 0;
   if (user.prUsedThisMonth >= limit) {
     console.log(`[webhook] Quota reached for ${user.login}: ${user.prUsedThisMonth}/${limit}`);
+    try {
+      const octokit = await getInstallationRestClient(installation.id);
+      await octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: prNumber,
+        body: `> ⚠️ **Mergecheck** — Monthly review quota reached (${user.prUsedThisMonth}/${limit} PRs used).\n> Upgrade your plan at [mergecheck.app](https://mergecheck.app) to continue getting reviews.`,
+      });
+    } catch (err) {
+      console.warn("[webhook] Failed to post quota comment:", err instanceof Error ? err.message : err);
+    }
     return;
   }
 
@@ -145,15 +157,20 @@ async function handlePullRequest(payload: any) {
     update: { status: "processing", reviewId: null },
   });
 
+  const processingCommentId = await postProcessingComment(installation.id, owner, repo, prNumber);
+
   try {
     const diff = await fetchPRDiff(installation.id, owner, repo, prNumber);
 
     if (diff.files.length === 0) {
+      if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId);
       await db.prReview.update({ where: { id: reviewRecord.id }, data: { status: "completed" } });
       return;
     }
 
     const comments = await reviewPRFiles(diff.files, diff.prTitle, repository.full_name);
+
+    if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId);
 
     const reviewId = await postPRReview(
       installation.id, owner, repo, prNumber, commitSha, comments
@@ -175,6 +192,7 @@ async function handlePullRequest(payload: any) {
     );
   } catch (err) {
     console.error(`[webhook] Review failed for PR #${prNumber} on ${repository.full_name}:`, err);
+    if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId).catch(() => null);
     await db.prReview.update({
       where: { id: reviewRecord.id },
       data: { status: "failed" },

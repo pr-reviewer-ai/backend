@@ -35,10 +35,10 @@ router.get("/", requireAuth, async (req, res) => {
     reviews: reviews.map((r) => ({
       id: r.id,
       repoFullName: r.repository.fullName,
-      prNumber: r.prNumber,
+      prNumber: Number(r.prNumber),
       commitSha: r.commitSha.slice(0, 7),
       status: r.status,
-      reviewId: r.reviewId,
+      reviewId: r.reviewId != null ? Number(r.reviewId) : null,
       createdAt: r.createdAt,
     })),
     total,
