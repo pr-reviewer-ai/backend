@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PlanTier {
+  free
+  pro
+  team
+}
+
+model User {
+  id          String   @id // GitHub node_id
+  githubId    Int      @unique @map("github_id")
+  login       String
+  email       String?
+  avatarUrl   String?  @map("avatar_url")
+  accessToken String   @map("access_token")
+  planTier    PlanTier @default(free) @map("plan_tier")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  installations Installation[]
+
+  @@map("users")
+}
+
+model Installation {
+  id               Int       @id // GitHub installation_id
+  userId           String    @map("user_id")
+  accountLogin     String    @map("account_login")
+  accountType      String    @map("account_type")
+  accountAvatarUrl String?   @map("account_avatar_url")
+  accessToken      String?   @map("access_token")
+  tokenExpiresAt   DateTime? @map("token_expires_at")
+  suspended        Boolean   @default(false)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  repositories Repository[]
+
+  @@map("installations")
+}
+
+model Repository {
+  id             Int      @id // GitHub repo id
+  installationId Int      @map("installation_id")
+  fullName       String   @map("full_name")
+  private        Boolean  @default(false)
+  defaultBranch  String   @default("main") @map("default_branch")
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  installation Installation @relation(fields: [installationId], references: [id], onDelete: Cascade)
+
+  @@map("repositories")
+}
