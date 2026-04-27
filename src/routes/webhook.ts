@@ -3,7 +3,7 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { db } from "../db/client.js";
 import { fetchPRDiff } from "../lib/pr-fetcher.js";
 import { reviewPRFiles } from "../lib/ai-reviewer.js";
-import { postPRReview } from "../lib/review-poster.js";
+import { postPRReview, postProcessingComment, deleteProcessingComment } from "../lib/review-poster.js";
 
 const router = Router();
 
@@ -145,15 +145,20 @@ async function handlePullRequest(payload: any) {
     update: { status: "processing", reviewId: null },
   });
 
+  const processingCommentId = await postProcessingComment(installation.id, owner, repo, prNumber);
+
   try {
     const diff = await fetchPRDiff(installation.id, owner, repo, prNumber);
 
     if (diff.files.length === 0) {
+      if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId);
       await db.prReview.update({ where: { id: reviewRecord.id }, data: { status: "completed" } });
       return;
     }
 
     const comments = await reviewPRFiles(diff.files, diff.prTitle, repository.full_name);
+
+    if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId);
 
     const reviewId = await postPRReview(
       installation.id, owner, repo, prNumber, commitSha, comments
@@ -175,6 +180,7 @@ async function handlePullRequest(payload: any) {
     );
   } catch (err) {
     console.error(`[webhook] Review failed for PR #${prNumber} on ${repository.full_name}:`, err);
+    if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId).catch(() => null);
     await db.prReview.update({
       where: { id: reviewRecord.id },
       data: { status: "failed" },

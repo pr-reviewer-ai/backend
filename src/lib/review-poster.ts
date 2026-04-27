@@ -1,6 +1,41 @@
 import { getInstallationRestClient } from "./github-app.js";
 import type { ReviewComment } from "./ai-reviewer.js";
 
+export async function postProcessingComment(
+  installationId: number,
+  owner: string,
+  repo: string,
+  prNumber: number
+): Promise<number | null> {
+  try {
+    const octokit = await getInstallationRestClient(installationId);
+    const { data } = await octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: prNumber,
+      body: "<!-- mergecheck-processing -->\n> 🔍 **Mergecheck** is reviewing your pull request…",
+    });
+    return data.id;
+  } catch (err) {
+    console.warn("[review-poster] Failed to post processing comment:", err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+export async function deleteProcessingComment(
+  installationId: number,
+  owner: string,
+  repo: string,
+  commentId: number
+): Promise<void> {
+  try {
+    const octokit = await getInstallationRestClient(installationId);
+    await octokit.rest.issues.deleteComment({ owner, repo, comment_id: commentId });
+  } catch (err) {
+    console.warn("[review-poster] Failed to delete processing comment:", err instanceof Error ? err.message : err);
+  }
+}
+
 export async function postPRReview(
   installationId: number,
   owner: string,

@@ -78,7 +78,7 @@ model PrReview {
   prNumber     Int      @map("pr_number")
   commitSha    String   @map("commit_sha")
   status       String   @default("pending") // pending | processing | completed | failed
-  reviewId     Int?     @map("review_id") // GitHub review ID
+  reviewId     BigInt?  @map("review_id") // GitHub review ID (64-bit)
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
