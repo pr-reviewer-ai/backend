@@ -4,6 +4,7 @@ import { db } from "../db/client.js";
 import { fetchPRDiff } from "../lib/pr-fetcher.js";
 import { reviewPRFiles } from "../lib/ai-reviewer.js";
 import { postPRReview, postProcessingComment, deleteProcessingComment } from "../lib/review-poster.js";
+import { getInstallationRestClient } from "../lib/github-app.js";
 
 const router = Router();
 
@@ -122,6 +123,17 @@ async function handlePullRequest(payload: any) {
   const limit = PR_LIMITS[user.planTier] ?? 0;
   if (user.prUsedThisMonth >= limit) {
     console.log(`[webhook] Quota reached for ${user.login}: ${user.prUsedThisMonth}/${limit}`);
+    try {
+      const octokit = await getInstallationRestClient(installation.id);
+      await octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: prNumber,
+        body: `> ⚠️ **Mergecheck** — Monthly review quota reached (${user.prUsedThisMonth}/${limit} PRs used).\n> Upgrade your plan at [mergecheck.app](https://mergecheck.app) to continue getting reviews.`,
+      });
+    } catch (err) {
+      console.warn("[webhook] Failed to post quota comment:", err instanceof Error ? err.message : err);
+    }
     return;
   }
 
