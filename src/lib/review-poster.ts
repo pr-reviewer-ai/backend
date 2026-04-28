@@ -13,7 +13,7 @@ export async function postProcessingComment(
       owner,
       repo,
       issue_number: prNumber,
-      body: "<!-- mergecheck-processing -->\n> 🔍 **Mergecheck** is reviewing your pull request…",
+      body: "<!-- MergeWell-processing -->\n> 🔍 **MergeWell** is reviewing your pull request…",
     });
     return data.id;
   } catch (err) {

@@ -33,6 +33,7 @@ model User {
   subscriptionEndsAt   DateTime? @map("subscription_ends_at")
   billingPeriod        String?   @map("billing_period")
   prUsedThisMonth      Int       @default(0) @map("pr_used_this_month")
+  billingCycleStart    DateTime? @map("billing_cycle_start")
 
   installations Installation[]
 

@@ -8,6 +8,13 @@ import { getInstallationRestClient } from "../lib/github-app.js";
 
 const router = Router();
 
+function addBillingPeriod(date: Date, period: string): Date {
+  const d = new Date(date);
+  if (period === "year") d.setFullYear(d.getFullYear() + 1);
+  else d.setMonth(d.getMonth() + 1);
+  return d;
+}
+
 const PR_LIMITS: Record<string, number> = {
   free: 5,
   founding_solo: 30,
@@ -107,7 +114,14 @@ async function handlePullRequest(payload: any) {
   // Load installation + owner user
   const installRecord = await db.installation.findUnique({
     where: { id: installation.id },
-    include: { user: { select: { id: true, login: true, planTier: true, prUsedThisMonth: true } } },
+    include: {
+      user: {
+        select: {
+          id: true, login: true, planTier: true,
+          prUsedThisMonth: true, billingCycleStart: true, billingPeriod: true,
+        },
+      },
+    },
   });
   if (!installRecord || installRecord.suspended) return;
 
@@ -118,8 +132,26 @@ async function handlePullRequest(payload: any) {
   });
   if (!repoRecord?.active) return;
 
-  // Enforce per-plan PR quota
+  // Lazy billing-cycle reset: if the stored cycle start has rolled over, reset the counter.
+  // This is a safety net for cases where the Paddle renewal webhook was missed.
   const user = installRecord.user;
+  if (user.billingCycleStart && user.billingPeriod) {
+    const cycleEnd = addBillingPeriod(user.billingCycleStart, user.billingPeriod);
+    if (new Date() >= cycleEnd) {
+      let newCycleStart = user.billingCycleStart;
+      while (addBillingPeriod(newCycleStart, user.billingPeriod) <= new Date()) {
+        newCycleStart = addBillingPeriod(newCycleStart, user.billingPeriod);
+      }
+      await db.user.update({
+        where: { id: user.id },
+        data: { prUsedThisMonth: 0, billingCycleStart: newCycleStart },
+      });
+      user.prUsedThisMonth = 0;
+      console.log(`[webhook] Billing cycle rolled over for ${user.login}, counter reset`);
+    }
+  }
+
+  // Enforce per-plan PR quota
   const limit = PR_LIMITS[user.planTier] ?? 0;
   if (user.prUsedThisMonth >= limit) {
     console.log(`[webhook] Quota reached for ${user.login}: ${user.prUsedThisMonth}/${limit}`);
@@ -129,7 +161,7 @@ async function handlePullRequest(payload: any) {
         owner,
         repo,
         issue_number: prNumber,
-        body: `> ⚠️ **Mergecheck** — Monthly review quota reached (${user.prUsedThisMonth}/${limit} PRs used).\n> Upgrade your plan at [mergecheck.app](https://mergecheck.app) to continue getting reviews.`,
+        body: `> ⚠️ **MergeWell** — Monthly review quota reached (${user.prUsedThisMonth}/${limit} PRs used).\n> Upgrade your plan at [MergeWell.app](https://MergeWell.app) to continue getting reviews.`,
       });
     } catch (err) {
       console.warn("[webhook] Failed to post quota comment:", err instanceof Error ? err.message : err);

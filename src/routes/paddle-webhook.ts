@@ -59,6 +59,22 @@ router.post("/", async (req, res) => {
       const hasScheduledCancel = data.scheduled_change?.action === "cancel";
       const effectiveStatus = hasScheduledCancel ? "cancelling" : (data.status ?? null);
 
+      const newCycleStart = data.current_billing_period?.starts_at
+        ? new Date(data.current_billing_period.starts_at)
+        : null;
+
+      // Detect billing renewal: new period start is later than what we stored
+      let resetCounter = false;
+      if (event_type === "subscription.created") {
+        resetCounter = true;
+      } else if (newCycleStart) {
+        const current = await db.user.findUnique({
+          where: { id: userId },
+          select: { billingCycleStart: true },
+        });
+        resetCounter = !current?.billingCycleStart || newCycleStart > current.billingCycleStart;
+      }
+
       await db.user.update({
         where: { id: userId },
         data: {
@@ -70,6 +86,8 @@ router.post("/", async (req, res) => {
             ? new Date(data.current_billing_period.ends_at)
             : null,
           billingPeriod: data.billing_cycle?.interval ?? null,
+          ...(newCycleStart && { billingCycleStart: newCycleStart }),
+          ...(resetCounter && { prUsedThisMonth: 0 }),
         },
       });
     }
