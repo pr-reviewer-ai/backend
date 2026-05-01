@@ -53,7 +53,7 @@ export async function postPRReview(
       pull_number: prNumber,
       commit_id: commitSha,
       event: "COMMENT",
-      body: "**AI Code Review** — No issues found. Looks good! ✓",
+      body: "**MergeWell** — No issues found. Looks good! ✓",
     });
     return data.id as number;
   }
@@ -67,8 +67,8 @@ export async function postPRReview(
 
   const summaryBody =
     comments.length === 1
-      ? "**AI Code Review** — 1 issue found."
-      : `**AI Code Review** — ${comments.length} issues found.`;
+      ? "**MergeWell** — 1 issue found."
+      : `**MergeWell** — ${comments.length} issues found.`;
 
   try {
     const { data } = await octokit.rest.pulls.createReview({
@@ -102,7 +102,7 @@ export async function postPRReview(
 }
 
 function buildFallbackBody(comments: ReviewComment[]): string {
-  const lines = [`**AI Code Review** — ${comments.length} issue(s) found:\n`];
+  const lines = [`**MergeWell** — ${comments.length} issue(s) found:\n`];
   for (const c of comments) {
     lines.push(`**\`${c.path}\` line ${c.line}**\n${c.body}\n`);
   }

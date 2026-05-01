@@ -2,6 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import type { FileDiff } from "./pr-fetcher.js";
+import { classifyFile } from "./file-classifier.js";
+import { runNextJsRules } from "./nextjs-rules.js";
 
 export interface ReviewComment {
   path: string;
@@ -66,7 +68,10 @@ async function callAnthropic(system: string, user: string): Promise<string> {
   return block?.type === "text" ? block.text : "";
 }
 
-// OpenAI — GPT-4o automatically caches system prompts >1024 tokens (no explicit opt-in needed)
+// OpenAI — prompt caching is automatic for prompts >1024 tokens on gpt-4o / gpt-4o-mini.
+// Cache key is the exact prefix, so the stable system prompt must come first (it does).
+// The per-file user message goes last — it changes every call and is never cached.
+// Cached tokens are billed at 50% of the input token price.
 async function callOpenAI(system: string, user: string): Promise<string> {
   const response = await getOpenAI().chat.completions.create({
     model: process.env.OPENAI_MODEL ?? "gpt-4o",
@@ -76,6 +81,13 @@ async function callOpenAI(system: string, user: string): Promise<string> {
       { role: "user", content: user },
     ],
   });
+
+  const cached = response.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const total  = response.usage?.prompt_tokens ?? 0;
+  if (total > 0) {
+    console.log(`[ai-reviewer] OpenAI cache: ${cached}/${total} prompt tokens cached (${Math.round(cached / total * 100)}%)`);
+  }
+
   return response.choices[0]?.message?.content ?? "";
 }
 
@@ -93,77 +105,135 @@ async function callGemini(system: string, user: string): Promise<string> {
 }
 
 // ~2500 tokens — must exceed Sonnet 4.6's 2048-token cache minimum
-const SYSTEM_PROMPT = `You are an expert code reviewer specializing in React, Next.js 13+ App Router, TypeScript, and Node.js/Express. You review pull request diffs and identify genuine bugs, security vulnerabilities, and significant code quality issues.
+const SYSTEM_PROMPT = `You are an expert Next.js code reviewer for Next.js 15/16 App Router projects. A per-file API reference is provided in each review request — use it to produce precise code suggestions with correct types and signatures, not generic advice.
 
 Only flag issues in these categories — skip style preferences, formatting, and nitpicks:
 - Bugs that cause incorrect behavior or runtime crashes
 - Security vulnerabilities
 - Performance issues that cause noticeable user-facing degradation
 - Type safety violations that hide real runtime errors
-- Framework misuse that breaks expected behavior or causes subtle bugs
+- Next.js / React framework misuse that breaks expected behavior
 
-## Next.js App Router
+Static analysis has already flagged deterministic violations listed in the prompt. DO NOT duplicate those.
+
+---
+
+## Next.js 15/16 Breaking Changes (apply to all file types)
+
+- \`params\` and \`searchParams\` in pages/layouts/route handlers/OG images are now **Promises** — the TypeScript type is \`Promise<{ key: string }>\`, and you must \`const { key } = await params\` before accessing properties.
+- \`cookies()\` and \`headers()\` from \`next/headers\` are now **async** — \`const cookieStore = await cookies()\`.
+- \`fetch()\` default caching changed: v13/14 default was \`force-cache\`; **v15+ default is \`auto no cache\`** (fetches every request unless you add explicit options).
+- Route Handler GET caching changed from static to dynamic by default in v15.
+- \`middleware.ts\` / \`middleware\` function is deprecated in v16 — renamed to \`proxy.ts\` / \`proxy\`. Codemod: \`npx @next/codemod@canary middleware-to-proxy .\`
+- \`<Image priority>\` deprecated in v16 → use \`preload\` prop instead.
+
+---
+
+## Server Components
 
 ALWAYS flag:
-- \`useState\`, \`useEffect\`, \`useRef\`, \`useContext\`, or any other React hook used inside a Server Component (a file in \`app/\` without \`"use client"\` at the top). This causes a build error.
-- \`"use client"\` directive placed after import statements. It must be the very first line of the file (before any imports) or Next.js ignores it and the component silently becomes a Server Component.
-- Accessing \`cookies()\`, \`headers()\`, \`searchParams\`, or dynamic route \`params\` synchronously in Next.js 15+. These are now async — must \`await cookies()\`, \`await headers()\`, \`const { id } = await params\`, etc. Calling them without \`await\` returns a Promise, not the value.
-- Any env var using the \`NEXT_PUBLIC_\` prefix that contains a secret (API keys, database URLs, service passwords, signing secrets). \`NEXT_PUBLIC_\` vars are inlined into the client bundle at build time and visible to every browser. Secrets must use server-only env vars (no prefix) and only be accessed in Server Components, Route Handlers, or Server Actions.
-- Data fetching (e.g. database calls, \`fetch\` with auth headers) done inside a Client Component (\`"use client"\`) that could safely be done in a Server Component. This exposes credentials to the client bundle and creates unnecessary round trips.
-- Missing \`loading.tsx\` or \`<Suspense>\` boundary around an async Server Component that does data fetching. Without it, the entire page blocks on the slowest data fetch.
-- Server Action (\`"use server"\`) declared inside a Client Component file instead of a separate server-only file. This leaks the module graph and can expose server-only code paths.
-- Using \`router.push()\` for redirects that should use \`redirect()\` from \`next/navigation\` in Server Components or Route Handlers. \`router.push\` requires a client context; misuse causes "invariant: attempted to hard navigate to the same URL" errors.
-- \`fetch()\` calls inside Server Components that cache indefinitely when the data is dynamic — should use \`{ cache: "no-store" }\` or \`{ next: { revalidate: N } }\`.
-- Passing non-serializable values (functions, class instances, Date objects) as props from a Server Component to a Client Component. Only plain JSON-serializable values can cross the server/client boundary.
+- React hooks (\`useState\`, \`useEffect\`, \`useRef\`, \`useReducer\`, \`useContext\`, \`useCallback\`, \`useMemo\`) — Server Components have no client runtime; this is a build error.
+- \`"use client"\` after import statements — Next.js silently ignores it; the file stays a Server Component and hooks will crash.
+- \`cookies()\`/\`headers()\` without \`await\` — returns a Promise object, not the value.
+- \`params.X\` or \`searchParams.X\` without prior \`await params\`/\`await searchParams\` — returns a Promise object.
+- \`fetch()\` without \`{ cache: 'force-cache' }\` or \`{ next: { revalidate: N } }\` when data is static — in v15 the default is no-store; static data will be re-fetched on every request.
+- Conflicting \`{ revalidate: N, cache: 'no-store' }\` on the same fetch — both options are silently ignored and a warning is logged; use one or the other.
+- Missing \`<Suspense>\` boundary around an async Server Component doing data fetching — the entire page blocks until the slowest fetch completes.
+- Non-serializable values (functions, class instances, Dates) passed as props to Client Components — only plain JSON-serializable values can cross the server/client boundary.
+- \`router.push()\` for navigation that belongs in a Server Component — use \`redirect()\` from \`next/navigation\` instead.
+- Server code that should be isolated imported without \`import 'server-only'\` — any accidental client import silently exposes it; use the \`server-only\` package as a build-time guard.
+
+## Client Components
+
+ALWAYS flag:
+- Database calls or \`fetch\` with auth headers/secrets — these run in the browser; move to a Server Component or Route Handler.
+- \`export const metadata\` — silently ignored; Next.js only reads metadata from Server Components.
+- Inline \`"use server"\` directive — declaring a Server Action inside a Client Component file leaks the module graph. Put Server Actions in a dedicated \`actions.ts\` with \`'use server'\` at the top.
+- \`useState\` initialized from a prop without a sync mechanism — if the prop changes the state stays at its initial value (derived-state anti-pattern).
+- \`useEffect\` missing a dependency that the effect reads — stale closure; the effect captures the old value and never re-runs when it changes.
+- Missing \`useEffect\` cleanup for subscriptions, event listeners, timers, or WebSockets — fires after unmount causing memory leaks.
+- Hooks called conditionally or after an early \`return\` — violates Rules of Hooks; causes "Rendered more hooks than previous render" crashes.
+- \`useMemo\`/\`useCallback\` with \`[]\` dependencies that close over changing values — permanently stale memoization.
+
+## Route Handlers
+
+ALWAYS flag:
+- \`"use client"\` — has no effect in Route Handlers; they always run on the server.
+- \`cookies()\`/\`headers()\` without \`await\` — they are async in v15+.
+- \`context.params\` accessed without \`await\` — \`params\` is a Promise in v15+.
+- Reading query string via \`req.url\` parsing instead of \`request.nextUrl.searchParams.get('key')\`.
+- Returning full database records with sensitive fields — always \`select\` explicit fields.
+- Missing \`null\` check after \`findUnique()\`/\`findFirst()\` before accessing properties — throws when record doesn't exist.
+- \`cors({ origin: '*' })\` on authenticated routes — allows any origin to make credentialed requests.
+- String-interpolated SQL — SQL injection; use parameterized queries.
+- Setting response headers via mutating \`headers()\` result — it's read-only. Pass headers to \`new Response(..., { headers: {} })\` or \`NextResponse.next({ request: { headers: requestHeaders } })\`.
+
+## Server Actions
+
+ALWAYS flag:
+- \`redirect()\` called before \`revalidatePath()\`/\`revalidateTag()\` — \`redirect()\` throws a control-flow exception; any code after it (including revalidation) never runs. Call revalidation first.
+- Database mutations without \`revalidatePath()\`/\`revalidateTag()\` — Next.js cache serves stale data after the mutation.
+- No authentication/authorization check at the top of the action — Server Actions are reachable via direct POST requests; middleware alone does not protect them.
+- \`FormData\` or arguments spread directly into a database write without validation — mass assignment. Use \`zod\` to parse inputs first.
+- Secrets or internal data returned from the action — actions are invoked from the client; return only what the UI needs.
+
+## Middleware / Proxy
+
+ALWAYS flag:
+- Matcher that matches \`/_next/static\`, \`/_next/image\`, or \`favicon.ico\` — runs on every static asset, degrades performance. Use a negative lookahead: \`/((?!_next/static|_next/image|favicon.ico).*)\`.
+- Missing \`export const config = { matcher: [...] }\` — middleware/proxy runs on every request including static assets.
+- Passing headers to the response via \`NextResponse.next({ headers: requestHeaders })\` — this sends headers to the client, not upstream. Use \`NextResponse.next({ request: { headers: requestHeaders } })\` to forward to the origin.
+- Still using \`middleware.ts\` / \`export function middleware\` in a v16 project — the correct file is \`proxy.ts\` with \`export function proxy\`.
 
 ## React Hooks
 
-ALWAYS flag:
-- Hook called inside a conditional, loop, nested function, or after an early \`return\`. This violates the Rules of Hooks and causes "Rendered more hooks than previous render" crashes.
-- \`useEffect\` with a missing dependency — a value used inside the effect that isn't in the dependency array. This creates a stale closure: the effect captures an old value and never re-runs when it changes, causing subtle bugs.
-- \`useEffect\` that calls \`setState\` unconditionally without a guard condition or with an empty dependency array (\`[]\`) but depends on a value that changes (triggers an infinite re-render loop or a React warning).
-- Missing cleanup in \`useEffect\` for subscriptions, event listeners, timers, or WebSocket connections. Without cleanup, the handler fires after the component unmounts, causing "Can't perform a React state update on an unmounted component" errors and memory leaks.
-- \`useState\` initialized with a prop value that the component doesn't synchronize on prop change (derived state anti-pattern). \`const [name, setName] = useState(props.name)\` — if \`props.name\` changes, \`name\` doesn't update.
-- Missing \`key\` prop in \`Array.map()\` rendering JSX, or using array index as \`key\` when items can be reordered, filtered, or deleted. Index keys cause React to reuse the wrong DOM nodes and corrupt component state.
-- \`useMemo\` or \`useCallback\` with \`[]\` as dependencies but referencing values that change — the memoized value becomes permanently stale.
-- \`useEffect\` used to sync two pieces of state (e.g. setting state B whenever state A changes). Almost always a sign the component has derived state that should be computed during render.
+ALWAYS flag (when not already caught by static analysis):
+- \`useMemo\` or \`useCallback\` dependency array is \`[]\` but the callback references a value that changes — permanently stale, produces wrong results.
+- \`useEffect\` used to sync state B whenever state A changes — almost always means state B is derived state that should be computed during render, not stored separately.
+- Array index used as \`key\` in \`Array.map()\` when items can be reordered, filtered, or deleted — React reuses the wrong DOM nodes and corrupts component state.
 
 ## TypeScript Safety
 
 ALWAYS flag:
-- \`as any\` or \`as unknown as T\` used to silence a type error that is a real bug — bypasses the type checker for the rest of the expression chain.
-- Non-null assertion \`!\` on a value that can legitimately be \`null\` or \`undefined\` at runtime (e.g. \`document.getElementById("foo")!\`, \`user.profile!.avatar\` where profile is optional). Crashes with "Cannot read properties of undefined".
-- \`JSON.parse()\` result used directly without type narrowing or a \`zod\`/\`superstruct\` parse — returns \`any\` and hides schema mismatches at runtime.
-- \`catch (e)\` block accessing \`e.message\` or \`e.stack\` without first narrowing: \`if (e instanceof Error)\`. In TypeScript's \`useUnknownInCatchVariables\` mode (enabled by \`strict\`) the caught value is \`unknown\`, not \`Error\`.
-- \`async\` function return type annotated as \`Promise<void>\` when callers discard the promise — unhandled rejection silently swallows errors. Flag \`const result = someAsyncFn()\` without \`await\` or \`.catch()\`.
-- Spreading \`...req.body\` directly into a database write (e.g. \`db.user.update({ data: { ...req.body } })\`) — mass assignment vulnerability. Explicit allow-lists should be used.
-- Type assertion on parsed user input: \`req.body as UserSchema\` — doesn't validate, only lies to the compiler.
+- \`as any\` or \`as unknown as T\` to suppress a real type error.
+- Non-null assertion \`!\` on a value that can be \`null\`/\`undefined\` at runtime.
+- \`JSON.parse()\` result used without \`zod\`/\`superstruct\` parsing or manual type narrowing — returns \`any\`.
+- \`catch (e)\` accessing \`e.message\` without \`if (e instanceof Error)\` — caught values are \`unknown\` in strict mode.
+- \`req.body as SomeType\` — type assertion with no runtime validation.
 
-## Node.js / Express
+## Security (all file types)
 
 ALWAYS flag:
-- \`async\` route handler without a \`try/catch\` block and no global async error middleware. In Express 4.x, an unhandled rejection in an async handler crashes the process. Even in Express 5, the error boundary should be explicit.
-- Missing \`await\` on a Prisma call, database query, or file write inside a route handler. The operation runs but the handler returns before it completes — writes may be lost, reads return stale data.
-- Sequential \`await\` calls that are independent and could run in parallel with \`Promise.all()\`. This adds latency equal to the sum of all calls instead of the slowest one.
-- String-interpolated SQL: \`db.query(\`SELECT * FROM users WHERE id = \${req.params.id}\`)\` — SQL injection. Always use parameterized queries or an ORM's safe query builder.
-- Synchronous file I/O (\`fs.readFileSync\`, \`JSON.parse(fs.readFileSync(...))\`) inside a request handler — blocks the Node.js event loop and stalls all other in-flight requests.
-- \`process.env.SOME_VAR\` used without a null check or startup validation. If the env var is missing in production the server silently uses \`undefined\`, causing cryptic downstream errors.
-- Returning full database records including sensitive fields (passwords, tokens, internal IDs) in API responses. Always select or exclude specific fields.
-- Prisma \`findUnique()\` or \`findFirst()\` result used without a \`null\` check before accessing properties — throws "Cannot read properties of null" when the record doesn't exist.
-- \`res.json()\` called after \`res.json()\` or \`res.send()\` in the same request — "Cannot set headers after they are sent to the client" error. Usually from missing \`return\` before early responses.
+- \`dangerouslySetInnerHTML={{ __html: userContent }}\` without sanitization — XSS.
+- \`eval()\` or \`new Function()\` with user-controlled input — RCE.
+- Auth tokens / JWTs in \`localStorage\`/\`sessionStorage\` — accessible to any XSS. Use \`HttpOnly\` cookies.
+- \`path.join(baseDir, req.query.file)\` without checking the result starts with \`baseDir\` — path traversal.
+- Secrets compared with \`===\` — timing side-channel. Use \`crypto.timingSafeEqual()\`.
+- \`child_process.exec()\`/\`execSync()\` with user-controlled input — command injection.
+- \`NEXT_PUBLIC_\` env vars containing secrets — inlined into the client bundle at build time.
 
-## Security
+## Next.js Image Component
 
 ALWAYS flag:
-- \`dangerouslySetInnerHTML={{ __html: userContent }}\` where \`userContent\` comes from user input or an external source without sanitization (e.g. DOMPurify). Direct XSS vector.
-- Template literals building HTML strings with user input: \`\`<div>\${userInput}</div>\`\` injected into the DOM — XSS.
-- \`eval(userInput)\` or \`new Function(userInput)\` — remote code execution.
-- Storing auth tokens, JWTs, or API keys in \`localStorage\` or \`sessionStorage\` — accessible to any XSS attack. Use \`HttpOnly\` cookies instead.
-- \`cors({ origin: "*" })\` on routes that check authentication or authorization — allows any site to make credentialed cross-origin requests, defeating CORS protection.
-- Path traversal: \`path.join(baseDir, req.query.file)\` or similar without validating the resolved path starts with \`baseDir\`. Attacker can escape to \`../../etc/passwd\`.
-- Comparing user-supplied secrets with \`===\` — timing side-channel. Use \`crypto.timingSafeEqual()\`.
-- Rate-limiting or authentication skipped on password reset, OTP, or login endpoints — brute-force vector.
-- \`child_process.exec()\` or \`execSync()\` with any user-controlled input — command injection.
+- \`<Image>\` without \`alt\` — required; breaks accessibility and Next.js lint rules.
+- \`<Image>\` without \`width\`+\`height\` AND without \`fill\` — required for layout shift prevention; throws at runtime.
+- \`<Image fill>\` inside a parent that lacks \`position: relative/absolute/fixed\` — image will not display.
+- \`<Image>\` without \`sizes\` when using \`fill\` or responsive layouts — browser assumes \`100vw\` and downloads unnecessarily large images.
+- \`<img>\` in \`app/\` files — use \`<Image>\` from \`next/image\` for automatic optimization.
+- \`priority\` prop on \`<Image>\` in a v16 project — deprecated; use \`preload\` instead.
+- Remote image \`src\` without a matching entry in \`next.config.js\` \`images.remotePatterns\` — Next.js blocks unregistered external domains.
+
+---
+
+## Pages Router APIs (forbidden in App Router)
+
+ALWAYS flag when found in \`app/\` files:
+- \`import { useRouter } from 'next/router'\` — Pages Router only; throws at runtime in App Router. Use \`useRouter\` / \`usePathname\` / \`useSearchParams\` / \`useParams\` from \`next/navigation\`.
+- \`import Head from 'next/head'\` — Pages Router only; silently ignored in \`app/\`. Export \`metadata\` or \`generateMetadata()\` from the nearest Server Component (page or layout).
+- \`export function getServerSideProps\` / \`getStaticProps\` / \`getStaticPaths\` — silently ignored in App Router; the export compiles but is never called. Fetch data directly in an \`async\` Server Component.
+- \`<a href="/...">\` for internal paths — causes a full page reload. Use \`<Link href="...">\` from \`next/link\` for client-side transitions, prefetching, and scroll restoration.
+
+---
 
 ## Output Format
 
@@ -171,15 +241,256 @@ Return ONLY a valid JSON array — no preamble, no explanation, no markdown fenc
 
 Each element:
 {
-  "line": <integer — the exact line number in the NEW version of the file where the issue appears>,
-  "body": "<one-sentence description of the bug/issue, one sentence explaining why it matters, and a concrete fix or code snippet>"
+  "line": <integer — the exact line number in the NEW version of the file>,
+  "body": "<[ERROR] or [WARNING] prefix — ERROR for bugs/crashes/security, WARNING for performance/best-practice. Then one sentence stating what is wrong and why it breaks. Then a fenced diff block showing exactly what to change — use - for lines to remove and + for lines to add, using actual variable names from the code and exact API signatures from the reference provided.>"
 }
 
+Example body:
+"[ERROR] \`useRouter\` is imported from \`next/router\` which is the Pages Router API and throws in App Router.\\n\`\`\`diff\\n- import { useRouter } from 'next/router'\\n+ import { useRouter } from 'next/navigation'\\n\`\`\`"
+
 Rules:
-- Only cite lines that appear as additions (prefixed with \`+\`) or context lines in the diff. Never cite a deleted line (prefixed with \`-\`).
-- If a file has no real issues, return \`[]\` for it.
-- Maximum 5 comments per file — prioritize the highest-severity issues.
-- Do not invent issues. Only flag what is clearly present in the diff.`;
+- Only cite addition lines (prefixed \`+\`) or context lines. Never cite deleted lines (\`-\`).
+- Return \`[]\` when there are no real issues.
+- Maximum 5 comments per file — prioritize highest severity.
+- Do not invent issues. Only flag what is clearly visible in the diff.
+- Do not duplicate any issue under "Already flagged by static analysis".`;
+
+// Returns a concise API reference for the specific file type being reviewed.
+// Injected into the user message (not the system prompt) so it's targeted and doesn't
+// bloat the cached system prompt with context irrelevant to the current file.
+function getFileTypeContext(fileType: import("./file-classifier.js").NextFileType): string {
+  switch (fileType) {
+    case "server-component":
+      return `## Server Component API Reference (Next.js 15+)
+
+Async page/layout with params (params is a Promise):
+\`\`\`tsx
+export default async function Page({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ slug: string }>
+  searchParams: Promise<{ q?: string }>
+}) {
+  const { slug } = await params
+  const { q } = await searchParams
+  const data = await fetch(\`/api/posts/\${slug}\`, {
+    next: { revalidate: 60 },   // ISR — revalidate every 60s
+    // OR: cache: 'force-cache'  // static
+    // OR: cache: 'no-store'     // always dynamic
+  })
+  return <Suspense fallback={<Loading />}><PostView data={data} /></Suspense>
+}
+\`\`\`
+
+cookies / headers (must await):
+\`\`\`ts
+import { cookies, headers } from 'next/headers'
+const cookieStore = await cookies()
+const token = cookieStore.get('token')?.value
+const headersList = await headers()
+const auth = headersList.get('authorization')
+\`\`\`
+
+Prevent server code from reaching client bundle:
+\`\`\`ts
+import 'server-only'  // build error if this file is imported in a Client Component
+\`\`\`
+
+fetch() caching (v15 default is no-store — be explicit):
+\`\`\`ts
+// Static (cached indefinitely):
+fetch(url, { cache: 'force-cache' })
+// ISR:
+fetch(url, { next: { revalidate: 3600 } })
+// Tagged for on-demand revalidation:
+fetch(url, { next: { tags: ['posts'] } })
+// Always dynamic:
+fetch(url, { cache: 'no-store' })
+// WRONG — conflicting options are silently ignored:
+fetch(url, { cache: 'no-store', next: { revalidate: 60 } })
+\`\`\``;
+
+    case "client-component":
+      return `## Client Component API Reference
+
+'use client' placement — must be above ALL imports:
+\`\`\`tsx
+'use client'           // ← FIRST line
+import { useState } from 'react'
+\`\`\`
+
+Correct useEffect with cleanup:
+\`\`\`tsx
+useEffect(() => {
+  const handler = () => { /* ... */ }
+  window.addEventListener('resize', handler)
+  return () => window.removeEventListener('resize', handler)  // cleanup required
+}, [dependency])  // every value read inside must be listed
+\`\`\`
+
+Server Actions in Client Components — import, never define inline:
+\`\`\`tsx
+// WRONG — inline "use server" in a client file leaks module graph:
+async function save() { 'use server'; /* ... */ }
+
+// CORRECT — import from a dedicated file:
+import { savePost } from '@/app/actions'
+\`\`\`
+
+useActionState for Server Action feedback:
+\`\`\`tsx
+import { useActionState, startTransition } from 'react'
+const [state, action, pending] = useActionState(savePost, null)
+\`\`\`
+
+Derived state — compute during render, don't sync with useEffect:
+\`\`\`tsx
+// WRONG:
+const [uppercased, setUppercased] = useState(text.toUpperCase())
+useEffect(() => setUppercased(text.toUpperCase()), [text])
+// CORRECT:
+const uppercased = text.toUpperCase()  // computed, not stored
+\`\`\``;
+
+    case "route-handler":
+      return `## Route Handler API Reference (Next.js 15+)
+
+Supported exports: GET POST PUT PATCH DELETE HEAD OPTIONS
+params is a Promise in v15+:
+\`\`\`ts
+import { NextRequest, NextResponse } from 'next/server'
+import { cookies, headers } from 'next/headers'
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params                          // must await
+  const query = request.nextUrl.searchParams.get('q') // query string
+  const cookieStore = await cookies()                 // must await
+  const auth = (await headers()).get('authorization') // must await
+  return NextResponse.json({ id })
+}
+\`\`\`
+
+Segment config:
+\`\`\`ts
+export const dynamic = 'force-dynamic'  // or 'force-static' | 'auto'
+export const revalidate = 60            // seconds
+export const runtime = 'nodejs'        // or 'edge'
+\`\`\`
+
+Setting cookies on the response (headers are read-only — cannot .set() them):
+\`\`\`ts
+// CORRECT:
+return new Response(body, { headers: { 'Set-Cookie': 'token=abc; HttpOnly' } })
+
+// WRONG — headers() result is read-only:
+const h = await headers(); h.set('x-foo', 'bar')
+\`\`\`
+
+Forwarding modified request headers upstream (not to client):
+\`\`\`ts
+// CORRECT:
+return NextResponse.next({ request: { headers: modifiedHeaders } })
+// WRONG — this sends headers to the client response:
+return NextResponse.next({ headers: modifiedHeaders })
+\`\`\``;
+
+    case "server-action-file":
+      return `## Server Action API Reference (Next.js 15+)
+
+File-level directive — all exports become Server Actions:
+\`\`\`ts
+'use server'
+import { revalidatePath, revalidateTag } from 'next/cache'
+import { redirect } from 'next/navigation'
+\`\`\`
+
+Mutation + revalidation — revalidate BEFORE redirect (redirect() throws):
+\`\`\`ts
+export async function createPost(formData: FormData) {
+  // 1. Validate input first
+  const title = formData.get('title')
+  if (!title) return { error: 'Title required' }
+
+  // 2. Check auth — middleware does NOT protect Server Actions
+  const session = await getSession()
+  if (!session) throw new Error('Unauthorized')
+
+  // 3. Mutate
+  await db.post.create({ data: { title: String(title) } })
+
+  // 4. Revalidate BEFORE redirect (redirect throws; code after it never runs)
+  revalidatePath('/posts')
+  redirect('/posts')   // ← must be last
+}
+\`\`\`
+
+On-demand cache invalidation by tag:
+\`\`\`ts
+revalidateTag('posts')  // invalidates all fetch() calls tagged with 'posts'
+\`\`\`
+
+useActionState pattern (Client Component side):
+\`\`\`tsx
+'use client'
+import { useActionState } from 'react'
+import { createPost } from './actions'
+const [state, action, pending] = useActionState(createPost, null)
+\`\`\``;
+
+    case "middleware":
+      return `## Middleware / Proxy API Reference
+
+v16 breaking change: rename middleware.ts → proxy.ts, function middleware → proxy:
+\`\`\`ts
+// proxy.ts  (was middleware.ts in v15)
+import { NextResponse } from 'next/server'
+import type { NextRequest } from 'next/server'
+
+export function proxy(request: NextRequest) {
+  return NextResponse.redirect(new URL('/home', request.url))
+}
+\`\`\`
+
+Matcher — exclude static assets with negative lookahead:
+\`\`\`ts
+export const config = {
+  matcher: [
+    '/((?!_next/static|_next/image|favicon.ico).*)',  // correct
+    // WRONG — matches everything including static assets:
+    // '/(.*)'
+  ],
+}
+\`\`\`
+
+Matcher values must be string constants (statically analyzed — no variables).
+
+Reading / writing cookies:
+\`\`\`ts
+// Read from request:
+const token = request.cookies.get('token')?.value
+// Write to response:
+const response = NextResponse.next()
+response.cookies.set({ name: 'session', value: 'abc', httpOnly: true, path: '/' })
+\`\`\`
+
+Forward modified request headers UPSTREAM (not to client):
+\`\`\`ts
+const requestHeaders = new Headers(request.headers)
+requestHeaders.set('x-user-id', userId)
+return NextResponse.next({ request: { headers: requestHeaders } })  // upstream
+// NOT: NextResponse.next({ headers: requestHeaders })              // goes to client
+\`\`\`
+
+Execution order: next.config.js headers → next.config.js redirects → proxy → filesystem routes.`;
+
+    default:
+      return "";
+  }
+}
 
 export async function reviewPRFiles(
   files: FileDiff[],
@@ -205,23 +516,46 @@ async function reviewSingleFile(
   prTitle: string,
   repoName: string
 ): Promise<ReviewComment[]> {
+  const fileType = classifyFile(file.filename, file.patch);
+  const violations = runNextJsRules(file.filename, fileType, file.patch);
+
+  const deterministicComments: ReviewComment[] = violations.map(v => ({
+    path: file.filename,
+    line: v.line,
+    body: `**[${v.severity.toUpperCase()}]** ${v.body}`,
+  }));
+
   const annotated = annotatePatchWithLineNumbers(file.patch);
+
+  const staticAnalysisNote = violations.length > 0
+    ? `\nAlready flagged by static analysis (DO NOT duplicate):\n${violations.map(v => `- Line ${v.line}: ${v.body}`).join("\n")}\n`
+    : "";
+
+  const fileTypeContext = getFileTypeContext(fileType);
 
   const userMessage = `Repository: ${repoName}
 PR title: ${prTitle}
 
-Review the following changed file for bugs, security issues, and framework misuse. Only flag issues on lines present in this diff.
-
-File: ${file.filename} (${file.status}, +${file.additions}/-${file.deletions})
+File: ${file.filename}
+File type: ${fileType}
+${staticAnalysisNote}
+${fileTypeContext ? `${fileTypeContext}\n` : ""}Review the following diff for bugs, security issues, and Next.js framework misuse specific to a ${fileType}. Use the API reference above for precise code suggestions.
 
 \`\`\`diff
 ${annotated}
 \`\`\`
 
-Respond ONLY with a JSON array in the format specified. Use the [L<number>] annotations to find the correct line numbers for the new file. If no issues, respond with: []`;
+Return ONLY a JSON array. Use the [L<number>] annotations for line numbers.`;
 
   const text = await callLLM(SYSTEM_PROMPT, userMessage);
-  return parseComments(file.filename, text);
+  const llmFindings = parseComments(file.filename, text);
+
+  // Drop LLM findings that land on a line already covered by a deterministic violation
+  const llmComments = llmFindings.filter(
+    c => !violations.some(v => Math.abs(v.line - c.line) <= 1)
+  );
+
+  return [...deterministicComments, ...llmComments];
 }
 
 // Prefixes each diff line with its new-file line number for the model to reference

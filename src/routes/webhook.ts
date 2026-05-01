@@ -47,16 +47,14 @@ router.post("/", async (req: Request & { rawBody?: Buffer }, res: Response) => {
 
   const payload = req.body;
 
-  try {
-    switch (event) {
-      case "installation": await handleInstallation(payload); break;
-      case "installation_repositories": await handleInstallationRepos(payload); break;
-      case "pull_request": await handlePullRequest(payload); break;
-    }
-  } catch (err) {
-    console.error(`Webhook error [${event}]:`, err);
-    res.status(500).json({ error: "Internal error" });
-    return;
+  // Respond immediately — GitHub gives only 10 seconds before marking delivery failed.
+  // Installation events are fast DB writes; only pull_request is fire-and-forget.
+  if (event === "installation") {
+    handleInstallation(payload).catch(err => console.error(`[webhook] installation error:`, err));
+  } else if (event === "installation_repositories") {
+    handleInstallationRepos(payload).catch(err => console.error(`[webhook] installation_repositories error:`, err));
+  } else if (event === "pull_request") {
+    handlePullRequest(payload).catch(err => console.error(`[webhook] PR review failed:`, err));
   }
 
   res.json({ ok: true });

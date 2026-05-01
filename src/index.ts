@@ -21,7 +21,7 @@ app.get("/.well-known/appspecific/com.chrome.devtools.json", (_req, res) => res.
 app.use(helmet());
 app.use(
   cors({
-    origin: ["http://localhost:3000", "https://connect-theme-tomorrow-officially.trycloudflare.com"],
+    origin: ["http://localhost:3000", "https://paperbacks-differently-pray-ann.trycloudflare.com"],
     credentials: true,
   })
 );
