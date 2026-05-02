@@ -21,7 +21,7 @@ app.get("/.well-known/appspecific/com.chrome.devtools.json", (_req, res) => res.
 app.use(helmet());
 app.use(
   cors({
-    origin: ["http://localhost:3000", "https://lightweight-tobacco-trader-sent.trycloudflare.com"],
+    origin: ["http://localhost:3000", "https://mergewell.codewavelabs.org"],
     credentials: true,
   })
 );
