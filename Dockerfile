@@ -2,12 +2,12 @@ FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY prisma ./prisma/
-RUN npm ci --ignore-scripts && npx prisma generate
+# Run full install (with scripts) so Prisma downloads its native query engine binary
+RUN npm ci
 
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/prisma ./prisma
 COPY . .
 RUN npm run build
 
@@ -20,6 +20,6 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/package.json ./
 
-EXPOSE 3001
+EXPOSE 8080
 
-CMD ["npm", "run", "start"]
+CMD ["node", "dist/index.js"]
