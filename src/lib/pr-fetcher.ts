@@ -1,4 +1,4 @@
-import { getInstallationRestClient } from "./github-app.js";
+import type { Octokit } from "@octokit/rest";
 
 // Files that add no value to review
 const SKIP_PATTERNS = [
@@ -43,12 +43,11 @@ export interface PRDiff {
 }
 
 export async function fetchPRDiff(
-  installationId: number,
+  octokit: InstanceType<typeof Octokit>,
   owner: string,
   repo: string,
   prNumber: number
 ): Promise<PRDiff> {
-  const octokit = await getInstallationRestClient(installationId);
 
   const [{ data: pr }, { data: rawFiles }] = await Promise.all([
     octokit.rest.pulls.get({ owner, repo, pull_number: prNumber }),

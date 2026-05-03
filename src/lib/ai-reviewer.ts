@@ -72,12 +72,20 @@ async function callAnthropic(system: string, user: string): Promise<string> {
 // Cache key is the exact prefix, so the stable system prompt must come first (it does).
 // The per-file user message goes last — it changes every call and is never cached.
 // Cached tokens are billed at 50% of the input token price.
+// o-series models (o1, o3, o4-mini, etc.) use the "developer" role instead of "system".
+// All other models use "system". Detect by model name prefix.
+function isOSeriesModel(model: string): boolean {
+  return /^o\d/.test(model);
+}
+
 async function callOpenAI(system: string, user: string): Promise<string> {
+  const model = process.env.OPENAI_MODEL ?? "gpt-4o";
+  const systemRole = isOSeriesModel(model) ? "developer" : "system";
   const response = await getOpenAI().chat.completions.create({
-    model: process.env.OPENAI_MODEL ?? "gpt-4o",
+    model,
     max_completion_tokens: 4096,
     messages: [
-      { role: "system", content: system },
+      { role: systemRole as "system", content: system },
       { role: "user", content: user },
     ],
   });
@@ -95,20 +103,34 @@ async function callOpenAI(system: string, user: string): Promise<string> {
   return response.choices[0]?.message?.content ?? "";
 }
 
-// Gemini — system instruction passed via model config
+// Gemini — system instruction passed via model config.
+// gemini-2.5-flash uses a thinking budget that counts against the output token limit;
+// set thinkingBudget: 0 to disable thinking for structured JSON tasks and reclaim tokens.
 async function callGemini(system: string, user: string): Promise<string> {
+  const modelName = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
   const model = getGemini().getGenerativeModel({
-    model: process.env.GEMINI_MODEL ?? "gemini-2.0-flash",
+    model: modelName,
     systemInstruction: system,
   });
   const result = await model.generateContent({
     contents: [{ role: "user", parts: [{ text: user }] }],
-    generationConfig: { maxOutputTokens: 4096 },
+    generationConfig: {
+      maxOutputTokens: 8192,
+      // Disable thinking budget on 2.5 models — thinking tokens consume output quota
+      // and produce reasoning prose that interferes with our JSON-only output format.
+      ...(modelName.includes("2.5") ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+    } as any,
   });
+
+  const candidate = result.response.candidates?.[0];
+  if (candidate?.finishReason === "MAX_TOKENS") {
+    console.warn(`[ai-reviewer] Gemini response truncated (MAX_TOKENS) for model ${modelName}`);
+  }
+
   return result.response.text();
 }
 
-// ~2500 tokens — must exceed Sonnet 4.6's 2048-token cache minimum
+// ~4000 tokens — must exceed Sonnet 4.6's 2048-token cache minimum
 const SYSTEM_PROMPT = `You are an expert Next.js code reviewer for Next.js 15/16 App Router projects. A per-file API reference is provided in each review request — use it to produce precise code suggestions with correct types and signatures, not generic advice.
 
 Only flag issues in these categories — skip style preferences, formatting, and nitpicks:
@@ -194,7 +216,41 @@ ALWAYS flag:
 ALWAYS flag (when not already caught by static analysis):
 - \`useMemo\` or \`useCallback\` dependency array is \`[]\` but the callback references a value that changes — permanently stale, produces wrong results.
 - \`useEffect\` used to sync state B whenever state A changes — almost always means state B is derived state that should be computed during render, not stored separately.
-- Array index used as \`key\` in \`Array.map()\` when items can be reordered, filtered, or deleted — React reuses the wrong DOM nodes and corrupts component state.
+- Array index used as \`key\` in \`Array.map()\` when items can be reordered, filtered, deleted, or appended — React reuses the wrong DOM nodes and corrupts component state. **Check every single \`.map()\` call in the file independently, including notification lists, log entries, and any dynamically-generated list — not just the main data table.**
+- \`setState\` / \`dispatch\` called directly inside the body of \`useMemo\` or \`useCallback\` (outside any event handler or async callback) — triggers a state update during render, causing an infinite loop. Move the side-effect into a \`useEffect\`.
+
+## React State Mutations
+
+ALWAYS flag:
+- \`array.sort()\` / \`array.reverse()\` / \`array.splice()\` called directly on a state variable — these mutate in place and return the same reference; React sees no change. The spread must come **before** the sort: \`[...state].sort(...)\`, not \`state.sort(...)\`.
+- \`.push()\`, \`.pop()\`, \`.shift()\`, \`.unshift()\` called on a state array before passing to the setter — mutates the existing snapshot, breaking time-travel, StrictMode double-invoke, and any consumers that hold a reference to the old array. Use \`[...prev, item]\` or \`prev.filter(...)\` in the setter callback.
+- \`obj.key = value\` followed by \`setState(obj)\` — the object reference is unchanged; React bails out of the re-render. Use \`setState({ ...obj, key: value })\`.
+- \`||\` used as a fallback where the left-hand value can legitimately be \`0\`, \`""\`, or \`false\` — those falsy values are treated as missing and the fallback is shown incorrectly. Use \`??\` (nullish coalescing) instead, which only falls back on \`null\`/\`undefined\`.
+
+## Async Fetch Lifecycle
+
+ALWAYS flag:
+- \`fetch()\` inside \`useEffect\` without an \`AbortController\` — if the component unmounts or the effect re-runs (deps change) before the response arrives, the in-flight request cannot be cancelled, and the \`setState\` call fires on a stale or unmounted component, overwriting newer results with old ones.
+  \`\`\`tsx
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(url, { signal: controller.signal })
+      .then(r => r.json()).then(data => { if (!controller.signal.aborted) setState(data); });
+    return () => controller.abort();
+  }, [url]);
+  \`\`\`
+- \`setState\` called after \`await\` inside \`useEffect\` without checking whether the component is still mounted — always guard with a local \`let cancelled = false\` flag or an AbortController signal.
+- \`useEffect\` cleanup that sets a ref (\`mountedRef.current = false\`) **before** clearing a timer or subscription — the timer may fire after the ref is false but before \`clearInterval\` runs, causing the guard to fire while the side-effect is still live. Always clear the timer first, then mark the ref.
+- A double-submit guard (\`ref.current\`, \`loading\` state, or a flag) that is checked before an async call but set to \`true\` after the first \`await\` — a second rapid click passes the guard in the gap between the check and the assignment. The flag must be set synchronously, before any \`await\`.
+- A double-submit guard flag that is never reset to \`false\` in the \`finally\` block — if the async operation fails, the user cannot retry because the flag stays locked permanently.
+
+## Cross-State Interactions
+
+Carefully trace how state variables interact across event handlers and effects. ALWAYS flag:
+- A search/filter input handler that updates the query but does **not** reset \`page\` / \`offset\` to \`0\` / \`1\` — the user stays on page N of the old results and sees an empty or wrong page for the new query.
+- A sort handler that changes \`sortField\` or \`sortDir\` but does **not** reset \`page\` to \`1\` — the current page may exceed \`totalPages\` under the new sort order.
+- A pagination total calculated with \`Math.floor(total / pageSize)\` — this drops the last partial page (e.g. 21 items / 10 per page = 2, but there are 3 pages). The correct formula is \`Math.ceil(total / pageSize)\`.
+- State arrays (notifications, log entries, messages) that are only ever appended to with no cap or cleanup — the array grows unboundedly in a long-running session, consuming memory and causing slow renders. Add a max-length slice or an auto-dismiss mechanism.
 
 ## TypeScript Safety
 
@@ -215,6 +271,8 @@ ALWAYS flag:
 - Secrets compared with \`===\` — timing side-channel. Use \`crypto.timingSafeEqual()\`.
 - \`child_process.exec()\`/\`execSync()\` with user-controlled input — command injection.
 - \`NEXT_PUBLIC_\` env vars containing secrets — inlined into the client bundle at build time.
+- URL query parameters or path segments built by string interpolation with user-controlled values and no \`encodeURIComponent()\` — spaces, \`&\`, \`=\`, and \`#\` corrupt the URL; a malicious value can inject additional parameters or break server-side parsing.
+- Client-supplied computed values (totals, prices, discounts) sent in a POST/PUT body without server-side recomputation — the server must always recompute and validate; trusting client arithmetic allows price manipulation via devtools.
 
 ## Next.js Image Component
 
@@ -226,6 +284,22 @@ ALWAYS flag:
 - \`<img>\` in \`app/\` files — use \`<Image>\` from \`next/image\` for automatic optimization.
 - \`priority\` prop on \`<Image>\` in a v16 project — deprecated; use \`preload\` instead.
 - Remote image \`src\` without a matching entry in \`next.config.js\` \`images.remotePatterns\` — Next.js blocks unregistered external domains.
+
+## Browser Storage APIs
+
+ALWAYS flag:
+- \`localStorage\` or \`sessionStorage\` accessed without a \`try/catch\` — throws a \`SecurityError\` synchronously in Safari private-browsing mode and cookie-blocked iframes, crashing the component on mount or on every state change.
+- \`JSON.parse(localStorage.getItem(...))\` without a null check — \`getItem\` returns \`null\` when the key is absent; \`JSON.parse(null)\` returns \`null\` but \`JSON.parse(undefined)\` throws.
+- Storing auth tokens or JWTs in \`localStorage\` / \`sessionStorage\` — accessible to any XSS payload. Use \`HttpOnly\` cookies instead.
+
+---
+
+## Fix Correctness
+
+Before emitting a diff, verify the suggested fix does not introduce a new bug:
+- \`setState\` / \`dispatch\` called inside a \`useMemo\` or \`useCallback\` body (not inside an event handler or \`useEffect\`) — side effects in memos cause infinite render loops; memos must be pure.
+- A fix that shallow-copies stale data (\`{ ...savedItem }\`) without re-fetching — does not solve the underlying staleness, only gives false confidence.
+- A guard variable set *after* the first \`await\` — the race condition remains. Guards must be set synchronously before any \`await\`.
 
 ---
 
@@ -255,7 +329,7 @@ Example body:
 Rules:
 - Only cite addition lines (prefixed \`+\`) or context lines. Never cite deleted lines (\`-\`).
 - Return \`[]\` when there are no real issues.
-- Maximum 5 comments per file — prioritize highest severity.
+- Maximum 15 comments per file — prioritize highest severity. Scan the ENTIRE file top-to-bottom; apply every rule to every function, hook, and JSX expression. Do not stop after finding the first few issues.
 - Do not invent issues. Only flag what is clearly visible in the diff.
 - Do not duplicate any issue under "Already flagged by static analysis".`;
 
@@ -630,17 +704,43 @@ function annotatePatchWithLineNumbers(patch: string): string {
   return out.join("\n");
 }
 
-function parseComments(filename: string, text: string): ReviewComment[] {
-  try {
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) {
-      if (text.trim().length > 0) {
-        console.warn(`[ai-reviewer] No JSON array found in LLM response for ${filename}. Response snippet: ${text.slice(0, 200)}`);
-      }
-      return [];
-    }
+// Walk the text character-by-character to find the outermost complete JSON array,
+// respecting string boundaries so that ] inside "body" values don't close the match.
+// Returns null if no complete array is found (e.g. response was truncated).
+function extractJsonArray(text: string): string | null {
+  const start = text.indexOf("[");
+  if (start === -1) return null;
 
-    const raw: Array<{ line: unknown; body: unknown }> = JSON.parse(match[0]);
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape)          { escape = false; continue; }
+    if (ch === "\\" && inString) { escape = true; continue; }
+    if (ch === '"')      { inString = !inString; continue; }
+    if (inString)        continue;
+    if (ch === "[")      { depth++; continue; }
+    if (ch === "]")      { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+
+  return null; // array never closed — response was truncated
+}
+
+function parseComments(filename: string, text: string): ReviewComment[] {
+  const json = extractJsonArray(text);
+
+  if (!json) {
+    if (text.trim().length > 0) {
+      // Likely a truncated response — log enough context to diagnose
+      console.warn(`[ai-reviewer] Truncated or missing JSON array for ${filename}. Response snippet: ${text.slice(0, 300)}`);
+    }
+    return [];
+  }
+
+  try {
+    const raw: Array<{ line: unknown; body: unknown }> = JSON.parse(json);
     return raw
       .filter(
         (c) =>
@@ -655,7 +755,7 @@ function parseComments(filename: string, text: string): ReviewComment[] {
         body: c.body as string,
       }));
   } catch (err) {
-    console.warn(`[ai-reviewer] Failed to parse LLM response for ${filename}: ${(err as Error).message}. Response snippet: ${text.slice(0, 200)}`);
+    console.warn(`[ai-reviewer] JSON parse failed for ${filename}: ${(err as Error).message}. Extracted: ${json.slice(0, 300)}`);
     return [];
   }
 }

@@ -36,3 +36,25 @@ export async function getInstallationRestClient(installationId: number): Promise
   const { token } = await getInstallationToken(installationId);
   return new Octokit({ auth: token });
 }
+
+// Retries fn on transient socket/network errors (e.g. "other side closed", ECONNRESET).
+// HTTP 4xx/5xx are not retried — those are deterministic API errors.
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  { attempts = 3, baseDelayMs = 300 }: { attempts?: number; baseDelayMs?: number } = {}
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient =
+        /other side closed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up/i.test(msg);
+      if (!isTransient || i === attempts - 1) throw err;
+      lastErr = err;
+      await new Promise(r => setTimeout(r, baseDelayMs * 2 ** i));
+    }
+  }
+  throw lastErr;
+}

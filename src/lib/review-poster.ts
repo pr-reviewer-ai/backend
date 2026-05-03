@@ -1,14 +1,13 @@
-import { getInstallationRestClient } from "./github-app.js";
+import type { Octokit } from "@octokit/rest";
 import type { ReviewComment } from "./ai-reviewer.js";
 
 export async function postProcessingComment(
-  installationId: number,
+  octokit: InstanceType<typeof Octokit>,
   owner: string,
   repo: string,
   prNumber: number
 ): Promise<number | null> {
   try {
-    const octokit = await getInstallationRestClient(installationId);
     const { data } = await octokit.rest.issues.createComment({
       owner,
       repo,
@@ -23,13 +22,12 @@ export async function postProcessingComment(
 }
 
 export async function deleteProcessingComment(
-  installationId: number,
+  octokit: InstanceType<typeof Octokit>,
   owner: string,
   repo: string,
   commentId: number
 ): Promise<void> {
   try {
-    const octokit = await getInstallationRestClient(installationId);
     await octokit.rest.issues.deleteComment({ owner, repo, comment_id: commentId });
   } catch (err) {
     console.warn("[review-poster] Failed to delete processing comment:", err instanceof Error ? err.message : err);
@@ -37,14 +35,13 @@ export async function deleteProcessingComment(
 }
 
 export async function postPRReview(
-  installationId: number,
+  octokit: InstanceType<typeof Octokit>,
   owner: string,
   repo: string,
   prNumber: number,
   commitSha: string,
   comments: ReviewComment[]
 ): Promise<number | null> {
-  const octokit = await getInstallationRestClient(installationId);
 
   if (comments.length === 0) {
     const { data } = await octokit.rest.pulls.createReview({

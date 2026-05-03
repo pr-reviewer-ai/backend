@@ -4,7 +4,7 @@ import { db } from "../db/client.js";
 import { fetchPRDiff } from "../lib/pr-fetcher.js";
 import { reviewPRFiles } from "../lib/ai-reviewer.js";
 import { postPRReview, postProcessingComment, deleteProcessingComment } from "../lib/review-poster.js";
-import { getInstallationRestClient } from "../lib/github-app.js";
+import { getInstallationRestClient, withRetry } from "../lib/github-app.js";
 
 const router = Router();
 
@@ -149,18 +149,22 @@ async function handlePullRequest(payload: any) {
     }
   }
 
+  // Create one authenticated Octokit client for the entire PR review lifecycle.
+  // This avoids re-exchanging the installation token on every GitHub API call
+  // and prevents stale-socket errors from repeated cold connections.
+  const octokit = await withRetry(() => getInstallationRestClient(installation.id));
+
   // Enforce per-plan PR quota
   const limit = PR_LIMITS[user.planTier] ?? 0;
   if (user.prUsedThisMonth >= limit) {
     console.log(`[webhook] Quota reached for ${user.login}: ${user.prUsedThisMonth}/${limit}`);
     try {
-      const octokit = await getInstallationRestClient(installation.id);
-      await octokit.rest.issues.createComment({
+      await withRetry(() => octokit.rest.issues.createComment({
         owner,
         repo,
         issue_number: prNumber,
         body: `> ⚠️ **MergeWell** — Monthly review quota reached (${user.prUsedThisMonth}/${limit} PRs used).\n> Upgrade your plan at [MergeWell.app](https://MergeWell.app) to continue getting reviews.`,
-      });
+      }));
     } catch (err) {
       console.warn("[webhook] Failed to post quota comment:", err instanceof Error ? err.message : err);
     }
@@ -187,24 +191,24 @@ async function handlePullRequest(payload: any) {
     update: { status: "processing", reviewId: null },
   });
 
-  const processingCommentId = await postProcessingComment(installation.id, owner, repo, prNumber);
+  const processingCommentId = await postProcessingComment(octokit, owner, repo, prNumber);
 
   try {
-    const diff = await fetchPRDiff(installation.id, owner, repo, prNumber);
+    const diff = await fetchPRDiff(octokit, owner, repo, prNumber);
 
     if (diff.files.length === 0) {
-      if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId);
+      if (processingCommentId) await deleteProcessingComment(octokit, owner, repo, processingCommentId);
       await db.prReview.update({ where: { id: reviewRecord.id }, data: { status: "completed" } });
       return;
     }
 
     const comments = await reviewPRFiles(diff.files, diff.prTitle, repository.full_name);
 
-    if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId);
+    if (processingCommentId) await deleteProcessingComment(octokit, owner, repo, processingCommentId);
 
-    const reviewId = await postPRReview(
-      installation.id, owner, repo, prNumber, commitSha, comments
-    );
+    const reviewId = await withRetry(() => postPRReview(
+      octokit, owner, repo, prNumber, commitSha, comments
+    ));
 
     await Promise.all([
       db.prReview.update({
@@ -222,7 +226,7 @@ async function handlePullRequest(payload: any) {
     );
   } catch (err) {
     console.error(`[webhook] Review failed for PR #${prNumber} on ${repository.full_name}:`, err);
-    if (processingCommentId) await deleteProcessingComment(installation.id, owner, repo, processingCommentId).catch(() => null);
+    if (processingCommentId) await deleteProcessingComment(octokit, owner, repo, processingCommentId).catch(() => null);
     await db.prReview.update({
       where: { id: reviewRecord.id },
       data: { status: "failed" },
