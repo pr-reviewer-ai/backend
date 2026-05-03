@@ -60,7 +60,7 @@ async function callLLM(system: string, user: string): Promise<string> {
 async function callAnthropic(system: string, user: string): Promise<string> {
   const response = await getAnthropic().messages.create({
     model: process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6",
-    max_tokens: 1024,
+    max_tokens: 4096,
     system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content: user }],
   });
@@ -75,7 +75,7 @@ async function callAnthropic(system: string, user: string): Promise<string> {
 async function callOpenAI(system: string, user: string): Promise<string> {
   const response = await getOpenAI().chat.completions.create({
     model: process.env.OPENAI_MODEL ?? "gpt-4o",
-    max_completion_tokens: 1024,
+    max_completion_tokens: 4096,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -86,6 +86,10 @@ async function callOpenAI(system: string, user: string): Promise<string> {
   const total  = response.usage?.prompt_tokens ?? 0;
   if (total > 0) {
     console.log(`[ai-reviewer] OpenAI cache: ${cached}/${total} prompt tokens cached (${Math.round(cached / total * 100)}%)`);
+  }
+  const finishReason = response.choices[0]?.finish_reason;
+  if (finishReason === "length") {
+    console.warn(`[ai-reviewer] OpenAI response truncated (finish_reason=length) — increase max_completion_tokens`);
   }
 
   return response.choices[0]?.message?.content ?? "";
@@ -99,7 +103,7 @@ async function callGemini(system: string, user: string): Promise<string> {
   });
   const result = await model.generateContent({
     contents: [{ role: "user", parts: [{ text: user }] }],
-    generationConfig: { maxOutputTokens: 1024 },
+    generationConfig: { maxOutputTokens: 4096 },
   });
   return result.response.text();
 }
@@ -511,6 +515,32 @@ export async function reviewPRFiles(
   return allComments;
 }
 
+// Split annotated patch into chunks of at most maxLines diff lines, breaking at @@ hunk
+// boundaries where possible so each chunk is self-contained.
+function splitAnnotatedPatch(annotated: string, maxLines: number): string[] {
+  const lines = annotated.split("\n");
+  if (lines.length <= maxLines) return [annotated];
+
+  const chunks: string[] = [];
+  let current: string[] = [];
+
+  for (const line of lines) {
+    // At a hunk header, flush current chunk if it is already large enough
+    if (line.startsWith("@@") && current.length >= maxLines) {
+      chunks.push(current.join("\n"));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) chunks.push(current.join("\n"));
+  return chunks;
+}
+
+// Lines of diff (additions + context) per LLM call.
+// ~120 lines × ~12 tokens/line ≈ 1 440 diff tokens, well within a 4 096-token output budget
+// alongside the system prompt (~1 900 tokens) and user-message header (~600 tokens).
+const CHUNK_LINE_THRESHOLD = 120;
+
 async function reviewSingleFile(
   file: FileDiff,
   prTitle: string,
@@ -526,32 +556,50 @@ async function reviewSingleFile(
   }));
 
   const annotated = annotatePatchWithLineNumbers(file.patch);
+  const chunks = splitAnnotatedPatch(annotated, CHUNK_LINE_THRESHOLD);
 
   const staticAnalysisNote = violations.length > 0
     ? `\nAlready flagged by static analysis (DO NOT duplicate):\n${violations.map(v => `- Line ${v.line}: ${v.body}`).join("\n")}\n`
     : "";
 
   const fileTypeContext = getFileTypeContext(fileType);
+  const totalChunks = chunks.length;
 
-  const userMessage = `Repository: ${repoName}
+  // Accumulate all LLM findings across chunks
+  const allLlmFindings: ReviewComment[] = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkLabel = totalChunks > 1 ? ` (part ${i + 1}/${totalChunks})` : "";
+
+    // Compact summary of what has already been flagged, so the model doesn't re-flag
+    const priorFindingsNote = allLlmFindings.length > 0
+      ? `\nAlready flagged in earlier parts (DO NOT duplicate):\n${allLlmFindings.map(c => `- Line ${c.line}: ${c.body.split("\n")[0]}`).join("\n")}\n`
+      : "";
+
+    const userMessage = `Repository: ${repoName}
 PR title: ${prTitle}
 
-File: ${file.filename}
+File: ${file.filename}${chunkLabel}
 File type: ${fileType}
-${staticAnalysisNote}
+${staticAnalysisNote}${priorFindingsNote}
 ${fileTypeContext ? `${fileTypeContext}\n` : ""}Review the following diff for bugs, security issues, and Next.js framework misuse specific to a ${fileType}. Use the API reference above for precise code suggestions.
 
 \`\`\`diff
-${annotated}
+${chunks[i]}
 \`\`\`
 
 Return ONLY a JSON array. Use the [L<number>] annotations for line numbers.`;
 
-  const text = await callLLM(SYSTEM_PROMPT, userMessage);
-  const llmFindings = parseComments(file.filename, text);
+    const text = await callLLM(SYSTEM_PROMPT, userMessage);
+    const findings = parseComments(file.filename, text);
+    if (totalChunks > 1) {
+      console.log(`[ai-reviewer] ${file.filename} chunk ${i + 1}/${totalChunks}: ${findings.length} finding(s)`);
+    }
+    allLlmFindings.push(...findings);
+  }
 
   // Drop LLM findings that land on a line already covered by a deterministic violation
-  const llmComments = llmFindings.filter(
+  const llmComments = allLlmFindings.filter(
     c => !violations.some(v => Math.abs(v.line - c.line) <= 1)
   );
 
@@ -585,7 +633,12 @@ function annotatePatchWithLineNumbers(patch: string): string {
 function parseComments(filename: string, text: string): ReviewComment[] {
   try {
     const match = text.match(/\[[\s\S]*\]/);
-    if (!match) return [];
+    if (!match) {
+      if (text.trim().length > 0) {
+        console.warn(`[ai-reviewer] No JSON array found in LLM response for ${filename}. Response snippet: ${text.slice(0, 200)}`);
+      }
+      return [];
+    }
 
     const raw: Array<{ line: unknown; body: unknown }> = JSON.parse(match[0]);
     return raw
@@ -601,7 +654,8 @@ function parseComments(filename: string, text: string): ReviewComment[] {
         line: c.line as number,
         body: c.body as string,
       }));
-  } catch {
+  } catch (err) {
+    console.warn(`[ai-reviewer] Failed to parse LLM response for ${filename}: ${(err as Error).message}. Response snippet: ${text.slice(0, 200)}`);
     return [];
   }
 }
