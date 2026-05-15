@@ -620,7 +620,7 @@ async function reviewSingleFile(
   prTitle: string,
   repoName: string
 ): Promise<ReviewComment[]> {
-  const fileType = classifyFile(file.filename, file.patch);
+  const fileType = classifyFile(file.filename, file.patch, file.rawContent);
   const violations = runNextJsRules(file.filename, fileType, file.patch);
 
   const deterministicComments: ReviewComment[] = violations.map(v => ({

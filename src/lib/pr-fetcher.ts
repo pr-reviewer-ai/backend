@@ -33,6 +33,7 @@ export interface FileDiff {
   patch: string;
   additions: number;
   deletions: number;
+  rawContent?: string; // full file at head SHA — used by classifier to detect unchanged directives
 }
 
 export interface PRDiff {
@@ -59,7 +60,9 @@ export async function fetchPRDiff(
     }),
   ]);
 
-  const files: FileDiff[] = (rawFiles as any[])
+  const headSha = pr.head.sha;
+
+  const baseDiffs: FileDiff[] = (rawFiles as any[])
     .filter((f) => f.status !== "removed")
     .filter((f) => !!f.patch) // binary files lack a patch
     .filter((f) => !SKIP_PATTERNS.some((p) => p.test(f.filename)))
@@ -72,9 +75,31 @@ export async function fetchPRDiff(
       deletions: f.deletions as number,
     }));
 
+  // Fetch full file content at head SHA so the classifier can detect "use client" /
+  // "use server" directives that were already present and not part of this diff.
+  const files = await Promise.all(
+    baseDiffs.map(async (f) => {
+      try {
+        const { data } = await octokit.rest.repos.getContent({
+          owner,
+          repo,
+          path: f.filename,
+          ref: headSha,
+        });
+        if (!Array.isArray(data) && data.type === "file" && data.content) {
+          const rawContent = Buffer.from(data.content, "base64").toString("utf-8");
+          return { ...f, rawContent };
+        }
+      } catch {
+        // Non-critical — fall back to patch-only classification
+      }
+      return f;
+    })
+  );
+
   return {
     files,
-    headSha: pr.head.sha,
+    headSha,
     prTitle: pr.title,
     prBody: pr.body ?? null,
   };

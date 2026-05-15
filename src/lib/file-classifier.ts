@@ -8,7 +8,7 @@ export type NextFileType =
   | "config"
   | "other";
 
-export function classifyFile(filename: string, patch: string): NextFileType {
+export function classifyFile(filename: string, patch: string, rawContent?: string): NextFileType {
   // Path-based (deterministic)
   if (/(?:^|\/)middleware\.[jt]sx?$/.test(filename)) return "middleware";
   if (/^(?:src\/)?app\/.*\/route\.[jt]sx?$/.test(filename)) return "route-handler";
@@ -16,9 +16,10 @@ export function classifyFile(filename: string, patch: string): NextFileType {
   if (/^(?:src\/)?pages\//.test(filename) && !/\/api\//.test(filename)) return "pages-component";
   if (/^(?:src\/)?pages\/api\//.test(filename)) return "route-handler";
 
-  // Content-based (for app/ files — scan added lines only)
-  const addedLines = patch.split("\n").filter(l => l.startsWith("+")).map(l => l.slice(1));
-  const content = addedLines.join("\n");
+  // Content-based: prefer the full file so we detect directives on lines not in the diff.
+  // Falling back to added-lines-only is a last resort that can produce false positives when
+  // "use client" / "use server" was already present but untouched in this PR.
+  const content = rawContent ?? patch.split("\n").filter(l => l.startsWith("+")).map(l => l.slice(1)).join("\n");
 
   if (/^\s*["']use client["']/m.test(content)) return "client-component";
   // "use server" in a page/layout is a misuse — treat as server-component so all
